@@ -1,3 +1,0 @@
-instagrapi
-moviepy<2
-pillow
