@@ -1,0 +1,13 @@
+node_modules
+dist
+.env
+.env.*
+!.env.example
+*.log
+.git
+__pycache__
+reelbot/accounts.json
+reelbot/data
+reelbot/videos
+reelbot/done
+reelbot/failed
