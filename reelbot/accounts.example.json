@@ -1,0 +1,30 @@
+{
+  "accounts": [
+    {
+      "name": "acc1",
+      "username": "your_username",
+      "password": "use env IG_PASS_ACC1 instead",
+      "totp_secret": "",
+      "proxy": null,
+      "daily_cap": 3,
+      "windows": [
+        "10:00-13:00",
+        "18:00-22:00"
+      ],
+      "min_gap_min": 120,
+      "max_gap_min": 300,
+      "captions": [
+        "{Wait for it|Watch till the end|You need to see this}",
+        "{New|Fresh|Latest} reel"
+      ],
+      "hashtags": [
+        "#reels",
+        "#viral",
+        "#explore",
+        "#trending",
+        "#fyp"
+      ],
+      "hashtags_per_post": 4
+    }
+  ]
+}
