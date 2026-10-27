@@ -1,98 +1,60 @@
 #!/usr/bin/env python3
 """
-reel_bot.py - multi-account Instagram Reel scheduler (unofficial, instagrapi).
+reel_bot.py (Koyeb version) - Instagram Reel auto-poster using instagrapi (unofficial).
 
-Features
-  * accounts.json: per-account daily cap, time windows, min/max gap, proxy, captions, hashtags
-  * SQLite state: never posts the same video twice per account, survives restarts
-  * session reuse (no fresh login each run), optional 2FA via TOTP secret
-  * jitter + gaps + daily caps so posting looks human and stays under limits
-  * error handling: challenge/login -> pause 12h, rate limit -> pause 1h, 3 fails -> quarantine file
-  * videos from videos/<account>/ first, then videos/shared/
+Runs as a background process next to the Node web service (see start.sh).
+  * Config:   env ACCOUNTS_JSON (+ IG_PASS_<NAME> or IG_SESSIONID_<NAME>)
+  * State:    Postgres (same DATABASE_URL), tables rb_posts / rb_state / rb_sessions
+  * Videos:   the existing `library` table (Telegram uploads or video_url), downloaded just before posting
+  * Keepalive: pings APP_BASE_URL/api/health so the free instance does not scale to zero
 
-Usage
-  python reel_bot.py init                  # create folders + example config
-  python reel_bot.py login                 # test login for all accounts
-  python reel_bot.py once acc1             # post one reel now for acc1 (test)
-  python reel_bot.py run                   # scheduler loop (leave running)
-  python reel_bot.py status                # today's counts + next post time
-  python reel_bot.py run --dry-run         # simulate, no uploads
+ACCOUNTS_JSON example:
+{"unique_across_accounts": true,
+ "accounts": [{"name":"acc1","username":"my_ig_name","daily_cap":2,
+   "windows":["10:00-13:00","18:00-22:00"],"min_gap_min":120,"max_gap_min":300,
+   "captions":["{Watch|Look at} this","{New|Fresh} reel"],
+   "hashtags":["#reels","#viral","#explore"],"hashtags_per_post":2}]}
+
+Optional env: REELBOT_DRY_RUN=true (log only, no upload), POST_TZ=Asia/Kolkata, TELEGRAM_BOT_TOKEN
+Commands: run | check
 """
 import argparse
-import hashlib
 import json
 import logging
 import os
 import random
 import re
 import shutil
-import sqlite3
 import sys
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-BASE = Path(__file__).resolve().parent
-DATA = BASE / "data"
-SESSIONS = DATA / "sessions"
-VIDEOS = BASE / "videos"
-DONE = BASE / "done"
-FAILED = BASE / "failed"
-CONFIG = BASE / "accounts.json"
-EXTS = {".mp4", ".mov", ".m4v"}
+TZ = ZoneInfo(os.environ.get("POST_TZ") or "Asia/Kolkata")
 MAX_FAILS = 3
-
+MAX_BYTES = 60 * 1024 * 1024
+DRY_RUN = os.environ.get("REELBOT_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 log = logging.getLogger("reelbot")
 
-
-# ----------------------------------------------------------------- setup
-def setup_logging():
-    DATA.mkdir(exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
-    log.setLevel(logging.INFO)
-    for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(DATA / "bot.log", encoding="utf-8")):
-        h.setFormatter(fmt)
-        log.addHandler(h)
+STATE = {}  # account -> {"next": datetime|None, "paused": datetime|None}   (in memory, saved to DB on change)
+COUNT = {}  # account -> (YYYY-MM-DD, posts today)
+_clients = {}
 
 
-def connect():
-    DATA.mkdir(exist_ok=True)
-    conn = sqlite3.connect(DATA / "state.db")
-    conn.row_factory = sqlite3.Row
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS posts(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          account TEXT NOT NULL, file_hash TEXT NOT NULL, file TEXT NOT NULL,
-          status TEXT NOT NULL, fails INTEGER NOT NULL DEFAULT 0,
-          media_pk TEXT, error TEXT, posted_at TEXT,
-          UNIQUE(account, file_hash));
-        CREATE TABLE IF NOT EXISTS state(
-          account TEXT PRIMARY KEY, next_allowed TEXT, paused_until TEXT);
-        """
-    )
-    return conn
+# ----------------------------------------------------------------- utils
+_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
 
 
-def load_config():
-    if not CONFIG.exists():
-        sys.exit("accounts.json nahi mila. Pehle: python reel_bot.py init")
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-    for a in cfg["accounts"]:
-        a.setdefault("daily_cap", 3)
-        a.setdefault("windows", ["10:00-13:00", "18:00-22:00"])
-        a.setdefault("min_gap_min", 120)
-        a.setdefault("max_gap_min", 300)
-        a.setdefault("proxy", None)
-        a.setdefault("captions", ["{Check|Watch|Look at} this"])
-        a.setdefault("hashtags", [])
-        a.setdefault("hashtags_per_post", 4)
-    return cfg
+def redact(s):
+    """Never let the Telegram bot token reach logs or the database."""
+    return _TOKEN_RE.sub("bot[redacted]", str(s))
 
 
-# ----------------------------------------------------------------- helpers
 def spin(text):
-    """{a|b|c} -> random choice, so captions are never identical."""
     pat = re.compile(r"\{([^{}]*)\}")
     while pat.search(text):
         text = pat.sub(lambda m: random.choice(m.group(1).split("|")), text, count=1)
@@ -107,18 +69,10 @@ def build_caption(acc):
     return cap
 
 
-def file_hash(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def parse_window(w):
     a, b = w.split("-")
-    ah, am = map(int, a.split(":"))
-    bh, bm = map(int, b.split(":"))
+    ah, am = map(int, a.strip().split(":"))
+    bh, bm = map(int, b.strip().split(":"))
     return ah * 60 + am, bh * 60 + bm
 
 
@@ -127,103 +81,219 @@ def in_window(acc, now):
     return any(s <= m <= e for s, e in map(parse_window, acc["windows"]))
 
 
-def iso(dt):
-    return dt.isoformat(timespec="seconds")
+# ----------------------------------------------------------------- config
+def load_accounts():
+    raw = os.environ.get("ACCOUNTS_JSON", "").strip()
+    if len(raw) > 1 and raw[0] in "'\"" and raw[-1] == raw[0]:
+        raw = raw[1:-1]  # Koyeb values often get pasted with quotes
+    if not raw:
+        sys.exit("ACCOUNTS_JSON env missing")
+    data = json.loads(raw)
+    if isinstance(data, list):
+        data = {"accounts": data}
+    accounts = data["accounts"]
+    for a in accounts:
+        a.setdefault("daily_cap", 2)
+        a.setdefault("windows", ["10:00-13:00", "18:00-22:00"])
+        a.setdefault("min_gap_min", 120)
+        a.setdefault("max_gap_min", 300)
+        a.setdefault("proxy", None)
+        a.setdefault("captions", ["{Check|Watch|Look at} this"])
+        a.setdefault("hashtags", [])
+        a.setdefault("hashtags_per_post", 3)
+        a.setdefault("user_id", None)  # optional: only use library rows of this app user
+    return accounts, bool(data.get("unique_across_accounts", True))
 
 
-def parse_iso(s):
-    return datetime.fromisoformat(s) if s else None
+# ----------------------------------------------------------------- database
+@contextmanager
+def db():
+    """Short-lived connection per operation (the free Postgres sleeps when idle)."""
+    import psycopg2
+
+    url = os.environ["DATABASE_URL"].strip().strip("\"'")
+    kw = {"sslmode": "require"} if os.environ.get("DATABASE_SSL", "").strip().lower() == "true" else {}
+    conn = psycopg2.connect(url, connect_timeout=30, **kw)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                yield cur
+    finally:
+        conn.close()
 
 
-def posted_today(conn, name, now):
-    day = now.strftime("%Y-%m-%d")
-    r = conn.execute(
-        "SELECT COUNT(*) c FROM posts WHERE account=? AND status='posted' AND posted_at LIKE ?",
-        (name, day + "%"),
-    ).fetchone()
-    return r["c"]
+def init_db():
+    with db() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rb_posts(
+              id SERIAL PRIMARY KEY,
+              account TEXT NOT NULL, library_id TEXT NOT NULL, status TEXT NOT NULL,
+              fails INT NOT NULL DEFAULT 0, media_pk TEXT, error TEXT, posted_at TIMESTAMPTZ,
+              UNIQUE(account, library_id));
+            CREATE TABLE IF NOT EXISTS rb_state(
+              account TEXT PRIMARY KEY, next_allowed TIMESTAMPTZ, paused_until TIMESTAMPTZ);
+            CREATE TABLE IF NOT EXISTS rb_sessions(
+              account TEXT PRIMARY KEY, settings TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+            """
+        )
 
 
-def get_state(conn, name):
-    r = conn.execute("SELECT * FROM state WHERE account=?", (name,)).fetchone()
-    return (parse_iso(r["next_allowed"]), parse_iso(r["paused_until"])) if r else (None, None)
+def load_state(accounts):
+    now = datetime.now(TZ)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    with db() as cur:
+        cur.execute("SELECT account, next_allowed, paused_until FROM rb_state")
+        for name, na, pu in cur.fetchall():
+            STATE[name] = {"next": na, "paused": pu}
+        cur.execute(
+            "SELECT account, COUNT(*) FROM rb_posts WHERE status='posted' AND posted_at >= %s GROUP BY account",
+            (day_start,),
+        )
+        for name, n in cur.fetchall():
+            COUNT[name] = (now.strftime("%Y-%m-%d"), int(n))
+    for a in accounts:
+        STATE.setdefault(a["name"], {"next": None, "paused": None})
 
 
-def set_state(conn, name, next_allowed=None, paused_until=None):
-    cur_next, cur_pause = get_state(conn, name)
-    na = next_allowed if next_allowed is not None else cur_next
-    pu = paused_until if paused_until is not None else cur_pause
-    conn.execute(
-        "INSERT INTO state(account,next_allowed,paused_until) VALUES(?,?,?) "
-        "ON CONFLICT(account) DO UPDATE SET next_allowed=excluded.next_allowed, paused_until=excluded.paused_until",
-        (name, iso(na) if na else None, iso(pu) if pu else None),
-    )
-    conn.commit()
+def save_state(name):
+    st = STATE[name]
+    with db() as cur:
+        cur.execute(
+            "INSERT INTO rb_state(account,next_allowed,paused_until) VALUES(%s,%s,%s) "
+            "ON CONFLICT(account) DO UPDATE SET next_allowed=EXCLUDED.next_allowed, paused_until=EXCLUDED.paused_until",
+            (name, st["next"], st["paused"]),
+        )
 
 
-def pick_video(conn, acc):
-    """First video (own folder, then shared) not yet posted/failed-out for this account."""
-    folders = [VIDEOS / acc["name"], VIDEOS / "shared"]
-    for folder in folders:
-        if not folder.exists():
-            continue
-        for p in sorted(folder.iterdir()):
-            if p.suffix.lower() not in EXTS:
-                continue
-            h = file_hash(p)
-            r = conn.execute("SELECT status FROM posts WHERE account=? AND file_hash=?", (acc["name"], h)).fetchone()
-            if r and r["status"] in ("posted", "quarantined"):
-                continue
-            return p, h
-    return None, None
+def today_count(name, now):
+    day, n = COUNT.get(name, ("", 0))
+    return n if day == now.strftime("%Y-%m-%d") else 0
+
+
+def load_session(name):
+    with db() as cur:
+        cur.execute("SELECT settings FROM rb_sessions WHERE account=%s", (name,))
+        r = cur.fetchone()
+    return json.loads(r[0]) if r else None
+
+
+def save_session(name, settings):
+    with db() as cur:
+        cur.execute(
+            "INSERT INTO rb_sessions(account,settings) VALUES(%s,%s) "
+            "ON CONFLICT(account) DO UPDATE SET settings=EXCLUDED.settings, updated_at=now()",
+            (name, json.dumps(settings)),
+        )
+
+
+def pick_video(acc, unique):
+    q = """
+      SELECT k.id::text, k.tg_file_id, k.video_url FROM library k
+      WHERE (k.tg_file_id IS NOT NULL OR k.video_url IS NOT NULL)
+        AND NOT EXISTS (
+          SELECT 1 FROM rb_posts p
+          WHERE p.library_id = k.id::text AND p.status IN ('posted','quarantined')
+            {acc_filter})
+        {user_filter}
+      ORDER BY k.created_at LIMIT 1"""
+    params = []
+    acc_filter = "" if unique else "AND p.account = %s"
+    if not unique:
+        params.append(acc["name"])
+    user_filter = ""
+    if acc.get("user_id"):
+        user_filter = "AND k.user_id::text = %s"
+        params.append(str(acc["user_id"]))
+    with db() as cur:
+        cur.execute(q.format(acc_filter=acc_filter, user_filter=user_filter), params)
+        return cur.fetchone()
+
+
+def record_fail(name, lib_id, inc, err):
+    with db() as cur:
+        cur.execute("SELECT fails FROM rb_posts WHERE account=%s AND library_id=%s", (name, lib_id))
+        r = cur.fetchone()
+        fails = (r[0] if r else 0) + inc
+        status = "quarantined" if fails >= MAX_FAILS else "failed"
+        cur.execute(
+            "INSERT INTO rb_posts(account,library_id,status,fails,error) VALUES(%s,%s,%s,%s,%s) "
+            "ON CONFLICT(account,library_id) DO UPDATE SET status=EXCLUDED.status, fails=EXCLUDED.fails, error=EXCLUDED.error",
+            (name, lib_id, status, fails, redact(err)[:300]),
+        )
+    return status
+
+
+# ----------------------------------------------------------------- download
+def download(lib_id, tg_file_id, video_url, dest_dir):
+    import requests
+
+    if tg_file_id:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN missing (needed to download Telegram videos)")
+        r = requests.post(f"https://api.telegram.org/bot{token}/getFile", json={"file_id": tg_file_id}, timeout=30)
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram getFile failed: {data.get('description')}")
+        url = f"https://api.telegram.org/file/bot{token}/{data['result']['file_path']}"
+    else:
+        url = video_url
+    dest = Path(dest_dir) / f"{lib_id}.mp4"
+    size = 0
+    with requests.get(url, stream=True, timeout=60) as resp:
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(1 << 20):
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    raise RuntimeError("video too large")
+                f.write(chunk)
+    return dest
 
 
 # ----------------------------------------------------------------- instagram
-_clients = {}
-
-
-def get_client(acc):
+def make_client(acc):
     from instagrapi import Client
-    from instagrapi.exceptions import LoginRequired
 
     name = acc["name"]
-    if name in _clients:
-        return _clients[name]
-
-    SESSIONS.mkdir(parents=True, exist_ok=True)
-    sess_file = SESSIONS / f"{name}.json"
-    password = os.environ.get(f"IG_PASS_{name.upper()}") or acc.get("password")
-    if not password:
-        raise RuntimeError(f"{name}: password missing (accounts.json ya env IG_PASS_{name.upper()})")
-
     cl = Client()
-    cl.delay_range = [2, 6]  # random delay between internal API calls
-    if acc.get("proxy"):
-        cl.set_proxy(acc["proxy"])
+    cl.delay_range = [2, 6]
+    password = os.environ.get(f"IG_PASS_{name.upper()}", "").strip()
+    sessionid = os.environ.get(f"IG_SESSIONID_{name.upper()}", "").strip()
 
-    def do_login():
-        code = ""
-        if acc.get("totp_secret"):
-            code = cl.totp_generate_code(acc["totp_secret"])
-        cl.login(acc["username"], password, verification_code=code)
-
-    logged_in = False
-    if sess_file.exists():
-        cl.load_settings(sess_file)
+    settings = load_session(name)
+    ok = False
+    if settings:
+        cl.set_settings(settings)
+        if acc.get("proxy"):
+            cl.set_proxy(acc["proxy"])
         try:
-            do_login()  # reuses session cookies/device, avoids a fresh-device login
-            cl.get_timeline_feed()  # cheap check that the session is alive
-            logged_in = True
-        except LoginRequired:
-            log.warning("%s: session expired, fresh login with same device ids", name)
+            cl.get_timeline_feed()  # cheap check that the stored session still works
+            ok = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: stored session invalid (%s), logging in again", name, redact(e)[:120])
             old = cl.get_settings()
             cl.set_settings({})
             cl.set_uuids(old.get("uuids", {}))
-    if not logged_in:
-        do_login()
-    cl.dump_settings(sess_file)
-    _clients[name] = cl
+    if not ok:
+        if acc.get("proxy"):
+            cl.set_proxy(acc["proxy"])
+        if sessionid:
+            cl.login_by_sessionid(sessionid)
+        elif password:
+            code = cl.totp_generate_code(acc["totp_secret"]) if acc.get("totp_secret") else ""
+            cl.login(acc["username"], password, verification_code=code)
+        else:
+            raise RuntimeError(f"{name}: set IG_PASS_{name.upper()} or IG_SESSIONID_{name.upper()}")
+    save_session(name, cl.get_settings())
     return cl
+
+
+def get_client(acc):
+    if acc["name"] not in _clients:
+        _clients[acc["name"]] = make_client(acc)
+    return _clients[acc["name"]]
 
 
 def classify(exc):
@@ -238,167 +308,121 @@ def classify(exc):
     return "other", timedelta(minutes=20)
 
 
-def post_one(conn, acc, dry_run=False):
-    """Upload exactly one reel for an account. Returns True if posted."""
+# ----------------------------------------------------------------- posting
+def post_one(acc, unique):
     name = acc["name"]
-    path, h = pick_video(conn, acc)
-    if not path:
-        log.info("%s: koi naya video nahi (videos/%s ya videos/shared mein daaliye)", name, name)
-        return False
+    st = STATE[name]
+    now = datetime.now(TZ)
+
+    row = pick_video(acc, unique)
+    if not row:
+        st["next"] = now + timedelta(minutes=15)  # memory only: do not wake the DB every minute
+        log.info("%s: library mein koi naya video nahi (Telegram bot se video bhejiye)", name)
+        return
+    lib_id, tg_file_id, video_url = row
     caption = build_caption(acc)
-    now = datetime.now()
 
-    if dry_run:
-        log.info("[dry-run] %s would post %s | caption: %s", name, path.name, caption.replace("\n", " "))
-        return True
+    if DRY_RUN:
+        st["next"] = now + timedelta(minutes=random.randint(acc["min_gap_min"], acc["max_gap_min"]))
+        log.info("[dry-run] %s would post library %s | caption: %s", name, lib_id, caption.replace("\n", " "))
+        return
 
+    tmp = tempfile.mkdtemp(prefix="rb_")
     try:
+        path = download(lib_id, tg_file_id, video_url, tmp)
         cl = get_client(acc)
         media = cl.clip_upload(path, caption)
-    except Exception as e:  # noqa: BLE001 - we classify below
+    except Exception as e:  # noqa: BLE001
         kind, wait = classify(e)
-        prev = conn.execute("SELECT fails FROM posts WHERE account=? AND file_hash=?", (name, h)).fetchone()
-        fails = (prev["fails"] if prev else 0) + (1 if kind == "other" else 0)
-        status = "quarantined" if fails >= MAX_FAILS else "failed"
-        conn.execute(
-            "INSERT INTO posts(account,file_hash,file,status,fails,error) VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(account,file_hash) DO UPDATE SET status=?, fails=?, error=?",
-            (name, h, str(path), status, fails, str(e)[:300], status, fails, str(e)[:300]),
-        )
-        conn.commit()
         _clients.pop(name, None)
-        set_state(conn, name, paused_until=now + wait)
-        log.error("%s: upload fail (%s): %s -> pause %s", name, kind, str(e)[:200], wait)
-        if status == "quarantined":
-            FAILED.mkdir(exist_ok=True)
-            shutil.move(str(path), FAILED / f"{name}_{path.name}")
-            log.error("%s: %s quarantined (%d fails)", name, path.name, fails)
-        return False
+        msg = redact(e)
+        status = record_fail(name, lib_id, 1 if kind == "other" else 0, msg)
+        st["paused"] = now + wait
+        save_state(name)
+        log.error("%s: upload fail (%s): %s -> pause %s [%s]", name, kind, msg[:200], wait, status)
+        return
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
-    conn.execute(
-        "INSERT INTO posts(account,file_hash,file,status,media_pk,posted_at) VALUES(?,?,?,'posted',?,?) "
-        "ON CONFLICT(account,file_hash) DO UPDATE SET status='posted', media_pk=excluded.media_pk, posted_at=excluded.posted_at",
-        (name, h, str(path), str(media.pk), iso(now)),
-    )
-    conn.commit()
-
-    # shared videos stay for other accounts; own-folder videos move to done/
-    if path.parent.name != "shared":
-        DONE.mkdir(exist_ok=True)
-        shutil.move(str(path), DONE / f"{name}_{path.name}")
-
+    with db() as cur:
+        cur.execute(
+            "INSERT INTO rb_posts(account,library_id,status,media_pk,posted_at) VALUES(%s,%s,'posted',%s,%s) "
+            "ON CONFLICT(account,library_id) DO UPDATE SET status='posted', media_pk=EXCLUDED.media_pk, posted_at=EXCLUDED.posted_at",
+            (name, lib_id, str(media.pk), now),
+        )
+    day = now.strftime("%Y-%m-%d")
+    COUNT[name] = (day, today_count(name, now) + 1)
     gap = random.randint(acc["min_gap_min"], acc["max_gap_min"])
-    set_state(conn, name, next_allowed=now + timedelta(minutes=gap))
-    log.info("%s: POSTED %s (pk=%s). next in ~%d min", name, path.name, media.pk, gap)
+    st["next"] = now + timedelta(minutes=gap)
+    save_state(name)
+    log.info("%s: POSTED library %s (pk=%s). next in ~%d min", name, lib_id, media.pk, gap)
+
+
+def due(acc, now):
+    st = STATE[acc["name"]]
+    if st["paused"] and now < st["paused"]:
+        return False
+    if today_count(acc["name"], now) >= acc["daily_cap"]:
+        return False
+    if not in_window(acc, now):
+        return False
+    if st["next"] and now < st["next"]:
+        return False
     return True
 
 
-# ----------------------------------------------------------------- commands
-def cmd_init(_):
-    for d in (DATA, SESSIONS, VIDEOS / "shared", DONE, FAILED):
-        d.mkdir(parents=True, exist_ok=True)
-    example = {
-        "accounts": [
-            {
-                "name": "acc1",
-                "username": "your_username",
-                "password": "use env IG_PASS_ACC1 instead",
-                "totp_secret": "",
-                "proxy": None,
-                "daily_cap": 3,
-                "windows": ["10:00-13:00", "18:00-22:00"],
-                "min_gap_min": 120,
-                "max_gap_min": 300,
-                "captions": ["{Wait for it|Watch till the end|You need to see this}", "{New|Fresh|Latest} reel"],
-                "hashtags": ["#reels", "#viral", "#explore", "#trending", "#fyp"],
-                "hashtags_per_post": 4,
-            }
-        ]
-    }
-    if not CONFIG.exists():
-        CONFIG.write_text(json.dumps(example, indent=2), encoding="utf-8")
-    print("Ready. accounts.json edit kijiye, videos videos/<account>/ ya videos/shared/ mein daaliye.")
+def keepalive():
+    import requests
 
-
-def cmd_login(_):
-    conn = connect()
-    for acc in load_config()["accounts"]:
-        try:
-            get_client(acc)
-            log.info("%s: login OK", acc["name"])
-        except Exception as e:  # noqa: BLE001
-            kind, wait = classify(e)
-            set_state(conn, acc["name"], paused_until=datetime.now() + wait)
-            log.error("%s: login fail (%s): %s", acc["name"], kind, str(e)[:200])
-
-
-def cmd_once(args):
-    conn = connect()
-    acc = next((a for a in load_config()["accounts"] if a["name"] == args.account), None)
-    if not acc:
-        sys.exit("account naam galat")
-    post_one(conn, acc, args.dry_run)
-
-
-def cmd_status(_):
-    conn = connect()
-    now = datetime.now()
-    for acc in load_config()["accounts"]:
-        na, pu = get_state(conn, acc["name"])
-        pending = sum(
-            1
-            for f in [*(VIDEOS / acc["name"]).glob("*"), *(VIDEOS / "shared").glob("*")]
-            if f.suffix.lower() in EXTS
-        )
-        print(
-            f"{acc['name']}: today {posted_today(conn, acc['name'], now)}/{acc['daily_cap']} | "
-            f"next_allowed {na} | paused_until {pu} | videos in folders {pending}"
-        )
-
-
-def cmd_run(args):
-    cfg = load_config()
-    conn = connect()
-    log.info("scheduler start (%d accounts)%s", len(cfg["accounts"]), " [dry-run]" if args.dry_run else "")
+    base = os.environ.get("APP_BASE_URL", "").strip().strip("\"'").rstrip("/")
+    if not base.startswith("https://"):
+        return
     while True:
-        now = datetime.now()
-        accounts = cfg["accounts"][:]
-        random.shuffle(accounts)  # no fixed account order
-        for acc in accounts:
-            name = acc["name"]
-            na, pu = get_state(conn, name)
-            if pu and now < pu:
-                continue
-            if posted_today(conn, name, now) >= acc["daily_cap"]:
-                continue
-            if not in_window(acc, now):
-                continue
-            if na and now < na:
-                continue
-            post_one(conn, acc, args.dry_run)
-            time.sleep(random.randint(20, 90))  # spacing between accounts
+        time.sleep(240)
+        try:
+            requests.get(base + "/api/health", timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ----------------------------------------------------------------- commands
+def cmd_check(_):
+    accounts, unique = load_accounts()
+    init_db()
+    with db() as cur:
+        cur.execute("SELECT COUNT(*) FROM library")
+        n = cur.fetchone()[0]
+    print(f"OK: {len(accounts)} account(s), unique_across_accounts={unique}, library rows={n}, tz={TZ}")
+
+
+def cmd_run(_):
+    accounts, unique = load_accounts()
+    init_db()
+    load_state(accounts)
+    threading.Thread(target=keepalive, daemon=True).start()
+    log.info("reelbot start: %d account(s), tz=%s%s", len(accounts), TZ, " [DRY-RUN]" if DRY_RUN else "")
+    while True:
+        try:
+            now = datetime.now(TZ)
+            random.shuffle(accounts)
+            for acc in accounts:
+                if due(acc, now):
+                    post_one(acc, unique)
+                    time.sleep(random.randint(20, 90))
+        except Exception as e:  # noqa: BLE001 - never let the loop die
+            log.error("loop error: %s", redact(e)[:300])
+            time.sleep(120)
         time.sleep(60)
 
 
 def main():
-    setup_logging()
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init").set_defaults(fn=cmd_init)
-    sub.add_parser("login").set_defaults(fn=cmd_login)
-    sub.add_parser("status").set_defaults(fn=cmd_status)
-    p = sub.add_parser("once")
-    p.add_argument("account")
-    p.add_argument("--dry-run", action="store_true")
-    p.set_defaults(fn=cmd_once)
-    p = sub.add_parser("run")
-    p.add_argument("--dry-run", action="store_true")
-    p.set_defaults(fn=cmd_run)
+    sub.add_parser("run").set_defaults(fn=cmd_run)
+    sub.add_parser("check").set_defaults(fn=cmd_check)
     args = ap.parse_args()
-    try:
-        args.fn(args)
-    except KeyboardInterrupt:
-        log.info("stopped")
+    args.fn(args)
 
 
 if __name__ == "__main__":
