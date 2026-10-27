@@ -1,0 +1,5 @@
+instagrapi
+moviepy<2
+psycopg2-binary
+requests
+tzdata
