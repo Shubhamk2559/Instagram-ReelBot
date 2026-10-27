@@ -160,6 +160,12 @@ def load_state(accounts):
             COUNT[name] = (now.strftime("%Y-%m-%d"), int(n))
     for a in accounts:
         STATE.setdefault(a["name"], {"next": None, "paused": None})
+    if os.environ.get("REELBOT_CLEAR_PAUSE", "").strip().lower() in ("1", "true", "yes"):
+        for st in STATE.values():
+            st["paused"] = None
+        with db() as cur:
+            cur.execute("UPDATE rb_state SET paused_until = NULL")
+        log.info("pauses cleared (REELBOT_CLEAR_PAUSE) - ab variable hata dijiye")
 
 
 def save_state(name):
