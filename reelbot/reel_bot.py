@@ -63,7 +63,7 @@ def spin(text):
 
 def build_caption(acc):
     cap = spin(random.choice(acc["captions"]))
-    tags = acc["hashtags"]
+    tags = [t if t.startswith("#") else "#" + t for t in acc["hashtags"]]  # "#" optional in config
     if tags:
         cap += "\n\n" + " ".join(random.sample(tags, min(acc["hashtags_per_post"], len(tags))))
     return cap
@@ -88,7 +88,13 @@ def load_accounts():
         raw = raw[1:-1]  # Koyeb values often get pasted with quotes
     if not raw:
         sys.exit("ACCOUNTS_JSON env missing")
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(
+            f"ACCOUNTS_JSON galat hai ({e.msg} at char {e.pos}, value ki lambai {len(raw)}). "
+            "Value ek hi line mein, { se shuru aur } par khatam, aur '#' ya line break ke bina honi chahiye."
+        )
     if isinstance(data, list):
         data = {"accounts": data}
     accounts = data["accounts"]
