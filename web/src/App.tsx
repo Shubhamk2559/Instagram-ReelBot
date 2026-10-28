@@ -6,7 +6,8 @@ type Account = {
   id: string;
   username: string;
   account_type: string | null;
-  status: "active" | "expired" | "revoked" | string;
+  auth_type?: "oauth" | "session" | string;
+  status: "active" | "expired" | "revoked" | "pending" | string;
   token_expires_at: string | null;
   connected_at: string;
   last_used_at: string | null;
@@ -96,6 +97,9 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [notice, setNotice] = useState<{ text: string; ok: boolean } | null>(null);
   const [connecting, setConnecting] = useState(false);
+  const [showSid, setShowSid] = useState(false);
+  const [sid, setSid] = useState("");
+  const [sidBusy, setSidBusy] = useState(false);
 
   const load = useCallback(() => {
     api<{ accounts: Account[] }>("/api/instagram/accounts")
@@ -113,6 +117,32 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
     window.addEventListener("pageshow", reset);
     return () => window.removeEventListener("pageshow", reset);
   }, [load]);
+
+  // While a Session ID is being verified by the worker, refresh every few seconds so the real username shows up by itself.
+  const hasPending = Boolean(accounts && accounts.some((a) => a.status === "pending"));
+  useEffect(() => {
+    if (!hasPending) return;
+    const t = setInterval(load, 4000);
+    return () => clearInterval(t);
+  }, [hasPending, load]);
+
+  async function connectSession(e: FormEvent) {
+    e.preventDefault();
+    if (sidBusy || !sid.trim()) return;
+    setSidBusy(true);
+    setNotice(null);
+    try {
+      await api("/api/instagram/session", { method: "POST", body: JSON.stringify({ sessionid: sid }) });
+      setSid("");
+      setShowSid(false);
+      setNotice({ text: "Session ID mil gaya. Verify ho raha hai, kuch second mein account ka username yahin dikh jayega.", ok: true });
+      load();
+    } catch (err) {
+      setNotice({ text: (err as Error).message, ok: false });
+    } finally {
+      setSidBusy(false);
+    }
+  }
 
   async function disconnect(id: string) {
     if (!window.confirm("Disconnect this Instagram account? Its waiting posts will be removed too.")) return;
@@ -167,21 +197,30 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
           <ul className="status">
             {accounts.map((a) => {
               const ok = a.status === "active";
+              const pending = a.status === "pending";
+              const viaSession = a.auth_type === "session";
               return (
                 <li key={a.id}>
                   <div className="left">
-                    <div className="avatar">{a.username.slice(0, 1).toUpperCase()}</div>
+                    <div className="avatar">{pending ? "⏳" : a.username.slice(0, 1).toUpperCase()}</div>
                     <div className="name">
-                      <b>@{a.username}</b>
-                      {ok ? (
-                        <small className="ok">● Connected{a.account_type ? ` · ${a.account_type.toLowerCase()}` : ""}</small>
+                      <b>{pending ? "Session verify ho raha hai..." : `@${a.username}`}</b>
+                      {pending ? (
+                        <small className="muted">Thoda wait karo, username apne aap dikhega</small>
+                      ) : ok ? (
+                        <small className="ok">● Connected{viaSession ? " · session ID" : a.account_type ? ` · ${a.account_type.toLowerCase()}` : ""}</small>
+                      ) : viaSession ? (
+                        <small className="bad">⚠ {a.last_error ?? "Session expire ho gaya. Naya session ID daalo."}</small>
                       ) : (
                         <small className="bad">⚠ Connection {a.status === "revoked" ? "was removed" : "expired"}</small>
                       )}
                     </div>
                   </div>
                   <div className="actions">
-                    {!ok && (
+                    {!ok && !pending && viaSession && (
+                      <button className="btn pink" onClick={() => setShowSid(true)}>Naya session ID</button>
+                    )}
+                    {!ok && !pending && !viaSession && (
                       <button className="btn pink" disabled={connecting} onClick={startConnect}>Reconnect Instagram</button>
                     )}
                     <button className="link bad-link" onClick={() => disconnect(a.id)}>Disconnect</button>
@@ -200,6 +239,31 @@ function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
           <button className="btn full" disabled={connecting} onClick={startConnect}>
             {connecting ? "Opening Instagram..." : hasAccounts ? "＋ Connect another account" : "Connect Instagram"}
           </button>
+        )}
+
+        {accounts !== null && (
+          <div style={{ marginTop: 14 }}>
+            {!showSid ? (
+              <button className="btn full pink" onClick={() => setShowSid(true)}>🔑 Session ID se connect karo</button>
+            ) : (
+              <form className="form" onSubmit={connectSession}>
+                <input
+                  type="password"
+                  placeholder="sessionid cookie value paste karo"
+                  value={sid}
+                  onChange={(e) => setSid(e.target.value)}
+                  autoComplete="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                />
+                <small className="muted">
+                  Browser mein instagram.com par login karo, phir Developer tools → Application → Cookies → instagram.com → sessionid ki value copy karke yahan paste karo. Ye password jaisa private hai, kisi ko mat bhejna.
+                </small>
+                <button className="btn full" disabled={sidBusy || !sid.trim()}>{sidBusy ? "Saving..." : "Connect with Session ID"}</button>
+                <button type="button" className="link plain" onClick={() => { setShowSid(false); setSid(""); }}>Cancel</button>
+              </form>
+            )}
+          </div>
         )}
       </section>
 
