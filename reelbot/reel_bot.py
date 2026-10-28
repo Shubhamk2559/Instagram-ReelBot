@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -141,6 +142,26 @@ def save_settings(acc_id, settings):
 
 
 # ----------------------------------------------------------------- instagram
+def ensure_moviepy_compat():
+    """instagrapi may look for moviepy.VideoFileClip (moviepy 2 style) or moviepy.editor (moviepy 1 style).
+    Make both work with whichever moviepy version is installed."""
+    try:
+        import moviepy
+    except ImportError:
+        return
+    try:
+        import moviepy.editor as editor  # moviepy 1.x
+    except ImportError:  # moviepy 2.x has no editor module: alias it to the top-level package
+        sys.modules.setdefault("moviepy.editor", moviepy)
+        return
+    for name in dir(editor):
+        if not name.startswith("_") and not hasattr(moviepy, name):
+            setattr(moviepy, name, getattr(editor, name))
+
+
+# Errors raised by our own / local code before anything was sent to Instagram: safe to retry.
+LOCAL_ERRORS = (AttributeError, ImportError, FileNotFoundError, TypeError, KeyError, NameError, IndexError)
+
 AUTH_ERRORS = {
     "LoginRequired", "ChallengeRequired", "BadPassword", "TwoFactorRequired", "ClientLoginRequired",
     "ChallengeUnknownStep", "SelectContactPointRecoveryForm", "RecaptchaChallengeForm",
@@ -393,12 +414,15 @@ def run_job(job):
         video = fetch_video(reel_id, tg_file_id, video_url, tmp)
         thumb = fetch_cover(cover_url, tmp)
         cl = get_client(acc_id, sid)
+        ensure_moviepy_compat()
         phase = "upload"
         media = cl.clip_upload(video, spin(caption or ""), thumbnail=thumb)
     except Exception as e:  # noqa: BLE001
         kind = classify(e)
         msg = redact(e)
         _clients.pop(acc_id, None)
+        if kind == "other":
+            log.error("traceback: %s", redact(traceback.format_exc())[-1500:])
         if kind == "auth":
             mark_account(acc_id, "expired", AUTH_MESSAGE)
             requeue(reel_id, 60, False, "Waiting for a new Session ID.")
@@ -407,7 +431,7 @@ def run_job(job):
             push_account_back(acc_id, 30)
             requeue(reel_id, 30 * 60, False, "Instagram rate limit; will try again later.")
             log.error("%s: rate limited: %s -> pause 30 min", acc_id[:8], msg[:200])
-        elif phase == "prepare":
+        elif phase == "prepare" or isinstance(e, LOCAL_ERRORS):
             if attempts < MAX_ATTEMPTS:
                 delay = min(1800, 120 * 2 ** max(attempts - 1, 0))
                 requeue(reel_id, delay, True, f"Temporary problem, retrying: {msg[:200]}")
