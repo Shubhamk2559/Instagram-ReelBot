@@ -437,7 +437,8 @@ async function recoverStale() {
        scheduled_at = now() + make_interval(secs => LEAST(1800, 120 * (2 ^ GREATEST(attempts - 1, 0)))::int),
        error = CASE WHEN attempts >= $1::int THEN 'Interrupted while preparing the upload. Not retried further.'
                     ELSE 'Interrupted (restart), retrying safely.' END
-     WHERE status = 'publishing' AND updated_at < now() - make_interval(mins => $2::int)`,
+     WHERE status = 'publishing' AND updated_at < now() - make_interval(mins => $2::int)
+       AND NOT EXISTS (SELECT 1 FROM instagram_accounts sa WHERE sa.id = reels.instagram_account_id AND sa.auth_type = 'session')`,
     [MAX_ATTEMPTS, STALE_MINUTES]
   );
 
@@ -522,7 +523,7 @@ async function claimDue(limit: number): Promise<Job[]> {
     `WITH cand AS (
        SELECT DISTINCT ON (r.instagram_account_id) r.id, r.scheduled_at, r.created_at
        FROM reels r
-       JOIN instagram_accounts a ON a.id = r.instagram_account_id AND a.status = 'active'
+       JOIN instagram_accounts a ON a.id = r.instagram_account_id AND a.status = 'active' AND a.auth_type = 'oauth'
        WHERE r.status = 'scheduled' AND r.scheduled_at <= now()
          AND NOT EXISTS (
            SELECT 1 FROM reels x
