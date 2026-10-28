@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-reel_bot.py (Koyeb version) - Instagram Reel auto-poster using instagrapi (unofficial).
+reel_bot.py (Koyeb, Session-ID mode) - posts the dashboard's scheduled Reels with instagrapi (unofficial).
 
-Runs as a background process next to the Node web service (see start.sh).
-  * Config:   env ACCOUNTS_JSON (+ IG_PASS_<NAME> or IG_SESSIONID_<NAME>)
-  * State:    Postgres (same DATABASE_URL), tables rb_posts / rb_state / rb_sessions
-  * Videos:   the existing `library` table (Telegram uploads or video_url), downloaded just before posting
-  * Keepalive: pings APP_BASE_URL/api/health so the free instance does not scale to zero
+How it fits together
+  * Dashboard "Session ID se connect karo" saves the cookie ENCRYPTED in instagram_accounts (auth_type='session', status='pending').
+  * This worker verifies it, fills in the real username and sets status='active'  -> the account shows on the home page.
+  * The normal Posting Plan / Telegram library / caption / cover create rows in `reels` (status 'scheduled').
+    The official Node publisher ignores session accounts; this worker posts them:
+        download video from Telegram (or video_url) -> clip_upload -> mark published/failed.
+  * Everything lives in Postgres (same DATABASE_URL), nothing on the container disk except temp files.
 
-ACCOUNTS_JSON example:
-{"unique_across_accounts": true,
- "accounts": [{"name":"acc1","username":"my_ig_name","daily_cap":2,
-   "windows":["10:00-13:00","18:00-22:00"],"min_gap_min":120,"max_gap_min":300,
-   "captions":["{Watch|Look at} this","{New|Fresh} reel"],
-   "hashtags":["#reels","#viral","#explore"],"hashtags_per_post":2}]}
-
-Optional env: REELBOT_DRY_RUN=true (log only, no upload), POST_TZ=Asia/Kolkata, TELEGRAM_BOT_TOKEN
+Env used: DATABASE_URL, DATABASE_SSL, TOKEN_ENCRYPTION_KEY, TELEGRAM_BOT_TOKEN (same as the web app),
+          optional: IG_DAILY_POST_CAP (default 10), IG_PROXY, APP_BASE_URL (keep-alive ping)
 Commands: run | check
 """
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -30,91 +28,57 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-TZ = ZoneInfo(os.environ.get("POST_TZ") or "Asia/Kolkata")
-MAX_FAILS = 3
-MAX_BYTES = 60 * 1024 * 1024
-DRY_RUN = os.environ.get("REELBOT_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 log = logging.getLogger("reelbot")
 
-STATE = {}  # account -> {"next": datetime|None, "paused": datetime|None}   (in memory, saved to DB on change)
-COUNT = {}  # account -> (YYYY-MM-DD, posts today)
-_clients = {}
+MAX_BYTES = 60 * 1024 * 1024
+MAX_ATTEMPTS = 3
+TICK_SECONDS = 15
+JOBS_PER_TICK = 3
+
+
+def _int_env(name, default, lo, hi):
+    try:
+        v = int(float(os.environ.get(name, "") or default))
+    except ValueError:
+        v = default
+    return max(lo, min(hi, v))
+
+
+DAILY_CAP = _int_env("IG_DAILY_POST_CAP", 10, 1, 25)
+
+_clients = {}  # account id -> instagrapi Client
 
 
 # ----------------------------------------------------------------- utils
-_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+_SECRET_PATTERNS = [
+    re.compile(r"bot\d+:[A-Za-z0-9_-]+"),  # Telegram bot token inside URLs
+    re.compile(r"\d{5,}(?:%3A|:)[A-Za-z0-9_.%-]{20,}"),  # Instagram sessionid
+    re.compile(r"sessionid=[^;\s'\"]+", re.I),
+]
 
 
-def redact(s):
-    """Never let the Telegram bot token reach logs or the database."""
-    return _TOKEN_RE.sub("bot[redacted]", str(s))
+def redact(value):
+    """Never let tokens or session ids reach logs or the database."""
+    s = str(value)
+    for p in _SECRET_PATTERNS:
+        s = p.sub("[redacted]", s)
+    return s
 
 
 def spin(text):
+    """{a|b|c} -> random choice, so captions can vary."""
     pat = re.compile(r"\{([^{}]*)\}")
     while pat.search(text):
         text = pat.sub(lambda m: random.choice(m.group(1).split("|")), text, count=1)
     return text
 
 
-def build_caption(acc):
-    cap = spin(random.choice(acc["captions"]))
-    tags = [t if t.startswith("#") else "#" + t for t in acc["hashtags"]]  # "#" optional in config
-    if tags:
-        cap += "\n\n" + " ".join(random.sample(tags, min(acc["hashtags_per_post"], len(tags))))
-    return cap
-
-
-def parse_window(w):
-    a, b = w.split("-")
-    ah, am = map(int, a.strip().split(":"))
-    bh, bm = map(int, b.strip().split(":"))
-    return ah * 60 + am, bh * 60 + bm
-
-
-def in_window(acc, now):
-    m = now.hour * 60 + now.minute
-    return any(s <= m <= e for s, e in map(parse_window, acc["windows"]))
-
-
-# ----------------------------------------------------------------- config
-def load_accounts():
-    raw = os.environ.get("ACCOUNTS_JSON", "").strip()
-    if len(raw) > 1 and raw[0] in "'\"" and raw[-1] == raw[0]:
-        raw = raw[1:-1]  # Koyeb values often get pasted with quotes
-    if not raw:
-        sys.exit("ACCOUNTS_JSON env missing")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        sys.exit(
-            f"ACCOUNTS_JSON galat hai ({e.msg} at char {e.pos}, value ki lambai {len(raw)}). "
-            "Value ek hi line mein, { se shuru aur } par khatam, aur '#' ya line break ke bina honi chahiye."
-        )
-    if isinstance(data, list):
-        data = {"accounts": data}
-    accounts = data["accounts"]
-    for a in accounts:
-        a.setdefault("daily_cap", 2)
-        a.setdefault("windows", ["10:00-13:00", "18:00-22:00"])
-        a.setdefault("min_gap_min", 120)
-        a.setdefault("max_gap_min", 300)
-        a.setdefault("proxy", None)
-        a.setdefault("captions", ["{Check|Watch|Look at} this"])
-        a.setdefault("hashtags", [])
-        a.setdefault("hashtags_per_post", 3)
-        a.setdefault("user_id", None)  # optional: only use library rows of this app user
-    return accounts, bool(data.get("unique_across_accounts", True))
-
-
 # ----------------------------------------------------------------- database
 @contextmanager
 def db():
-    """Short-lived connection per operation (the free Postgres sleeps when idle)."""
+    """Short-lived connection per operation (works well with a sleepy free Postgres)."""
     import psycopg2
 
     url = os.environ["DATABASE_URL"].strip().strip("\"'")
@@ -131,127 +95,174 @@ def db():
 def init_db():
     with db() as cur:
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rb_posts(
-              id SERIAL PRIMARY KEY,
-              account TEXT NOT NULL, library_id TEXT NOT NULL, status TEXT NOT NULL,
-              fails INT NOT NULL DEFAULT 0, media_pk TEXT, error TEXT, posted_at TIMESTAMPTZ,
-              UNIQUE(account, library_id));
-            CREATE TABLE IF NOT EXISTS rb_state(
-              account TEXT PRIMARY KEY, next_allowed TIMESTAMPTZ, paused_until TIMESTAMPTZ);
-            CREATE TABLE IF NOT EXISTS rb_sessions(
-              account TEXT PRIMARY KEY, settings TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
-            """
+            """CREATE TABLE IF NOT EXISTS rb_sessions(
+                 account TEXT PRIMARY KEY, settings TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"""
         )
-
-
-def load_state(accounts):
-    now = datetime.now(TZ)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    with db() as cur:
-        cur.execute("SELECT account, next_allowed, paused_until FROM rb_state")
-        for name, na, pu in cur.fetchall():
-            STATE[name] = {"next": na, "paused": pu}
+        # This worker is the only one posting session accounts. After a restart nothing is really in flight,
+        # so leftovers are marked failed (NOT retried: they may have been posted, never risk a duplicate).
         cur.execute(
-            "SELECT account, COUNT(*) FROM rb_posts WHERE status='posted' AND posted_at >= %s GROUP BY account",
-            (day_start,),
-        )
-        for name, n in cur.fetchall():
-            COUNT[name] = (now.strftime("%Y-%m-%d"), int(n))
-    for a in accounts:
-        STATE.setdefault(a["name"], {"next": None, "paused": None})
-    if os.environ.get("REELBOT_CLEAR_PAUSE", "").strip().lower() in ("1", "true", "yes"):
-        for st in STATE.values():
-            st["paused"] = None
-        with db() as cur:
-            cur.execute("UPDATE rb_state SET paused_until = NULL")
-        log.info("pauses cleared (REELBOT_CLEAR_PAUSE) - ab variable hata dijiye")
-
-
-def save_state(name):
-    st = STATE[name]
-    with db() as cur:
-        cur.execute(
-            "INSERT INTO rb_state(account,next_allowed,paused_until) VALUES(%s,%s,%s) "
-            "ON CONFLICT(account) DO UPDATE SET next_allowed=EXCLUDED.next_allowed, paused_until=EXCLUDED.paused_until",
-            (name, st["next"], st["paused"]),
+            """UPDATE reels SET status = 'failed',
+                 error = 'Restart ke dauran interrupt hua. Instagram profile check karo, dobara auto-post nahi kiya.'
+               WHERE status = 'publishing'
+                 AND instagram_account_id IN (SELECT id FROM instagram_accounts WHERE auth_type = 'session')"""
         )
 
 
-def today_count(name, now):
-    day, n = COUNT.get(name, ("", 0))
-    return n if day == now.strftime("%Y-%m-%d") else 0
+def decrypt_token(payload):
+    """Same format as the web app's encryptToken(): v1:iv:tag:ciphertext (AES-256-GCM, scrypt key)."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    key = hashlib.scrypt(
+        os.environ["TOKEN_ENCRYPTION_KEY"].encode("utf-8"),
+        salt=b"reel-scheduler-token-key-v1",
+        n=16384, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024,
+    )
+    v, iv, tag, ct = payload.split(":")
+    if v != "v1":
+        raise ValueError("bad token payload")
+    b = base64.b64decode
+    return AESGCM(key).decrypt(b(iv), b(ct) + b(tag), None).decode("utf-8")
 
 
-def load_session(name):
+def load_settings(acc_id):
     with db() as cur:
-        cur.execute("SELECT settings FROM rb_sessions WHERE account=%s", (name,))
+        cur.execute("SELECT settings FROM rb_sessions WHERE account = %s", (acc_id,))
         r = cur.fetchone()
     return json.loads(r[0]) if r else None
 
 
-def save_session(name, settings):
+def save_settings(acc_id, settings):
     with db() as cur:
         cur.execute(
-            "INSERT INTO rb_sessions(account,settings) VALUES(%s,%s) "
-            "ON CONFLICT(account) DO UPDATE SET settings=EXCLUDED.settings, updated_at=now()",
-            (name, json.dumps(settings)),
+            "INSERT INTO rb_sessions(account, settings) VALUES (%s, %s) "
+            "ON CONFLICT (account) DO UPDATE SET settings = EXCLUDED.settings, updated_at = now()",
+            (acc_id, json.dumps(settings)),
         )
 
 
-def pick_video(acc, unique):
-    q = """
-      SELECT k.id::text, k.tg_file_id, k.video_url FROM library k
-      WHERE (k.tg_file_id IS NOT NULL OR k.video_url IS NOT NULL)
-        AND NOT EXISTS (
-          SELECT 1 FROM rb_posts p
-          WHERE p.library_id = k.id::text AND p.status IN ('posted','quarantined')
-            {acc_filter})
-        {user_filter}
-      ORDER BY k.created_at LIMIT 1"""
-    params = []
-    acc_filter = "" if unique else "AND p.account = %s"
-    if not unique:
-        params.append(acc["name"])
-    user_filter = ""
-    if acc.get("user_id"):
-        user_filter = "AND k.user_id::text = %s"
-        params.append(str(acc["user_id"]))
-    with db() as cur:
-        cur.execute(q.format(acc_filter=acc_filter, user_filter=user_filter), params)
-        return cur.fetchone()
+# ----------------------------------------------------------------- instagram
+AUTH_ERRORS = {
+    "LoginRequired", "ChallengeRequired", "BadPassword", "TwoFactorRequired", "ClientLoginRequired",
+    "ChallengeUnknownStep", "SelectContactPointRecoveryForm", "RecaptchaChallengeForm",
+    "ReloginAttemptExceeded", "CheckpointRequired", "ConsentRequired",
+}
+RATE_ERRORS = {"PleaseWaitFewMinutes", "RateLimitError", "FeedbackRequired", "ClientThrottledError"}
 
 
-def record_fail(name, lib_id, inc, err):
+def classify(exc):
+    names = {c.__name__ for c in type(exc).__mro__}
+    text = str(exc).lower()
+    if names & AUTH_ERRORS or "login_required" in text or "checkpoint_required" in text or "challenge_required" in text:
+        return "auth"
+    if names & RATE_ERRORS or "please wait a few minutes" in text or "rate limit" in text:
+        return "rate"
+    return "other"
+
+
+AUTH_MESSAGE = "Session ID expire ho gaya ya Instagram ne verification maanga. Instagram app/browser mein check karke naya session ID daalo."
+
+
+def make_client(acc_id, sessionid):
+    from instagrapi import Client
+
+    proxy = os.environ.get("IG_PROXY", "").strip()
+
+    def fresh():
+        c = Client()
+        c.delay_range = [2, 6]
+        return c
+
+    cl = fresh()
+    ok = False
+    settings = load_settings(acc_id)
+    if settings:
+        try:
+            cl.set_settings(settings)
+            if proxy:
+                cl.set_proxy(proxy)
+            cl.get_timeline_feed()  # cheap check that the stored session still works
+            ok = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: stored session not valid (%s), using the saved Session ID again", acc_id[:8], redact(e)[:120])
+            old = cl.get_settings()
+            cl = fresh()
+            cl.set_uuids(old.get("uuids", {}))
+    if not ok:
+        if proxy:
+            cl.set_proxy(proxy)
+        cl.login_by_sessionid(sessionid)
+    save_settings(acc_id, cl.get_settings())
+    return cl
+
+
+def get_client(acc_id, sessionid):
+    if acc_id not in _clients:
+        _clients[acc_id] = make_client(acc_id, sessionid)
+    return _clients[acc_id]
+
+
+def account_secret(acc_id):
     with db() as cur:
-        cur.execute("SELECT fails FROM rb_posts WHERE account=%s AND library_id=%s", (name, lib_id))
+        cur.execute("SELECT access_token_encrypted, username FROM instagram_accounts WHERE id = %s::uuid", (acc_id,))
         r = cur.fetchone()
-        fails = (r[0] if r else 0) + inc
-        status = "quarantined" if fails >= MAX_FAILS else "failed"
+    if not r:
+        raise RuntimeError("account removed")
+    return decrypt_token(r[0]), r[1]
+
+
+def mark_account(acc_id, status, message):
+    with db() as cur:
         cur.execute(
-            "INSERT INTO rb_posts(account,library_id,status,fails,error) VALUES(%s,%s,%s,%s,%s) "
-            "ON CONFLICT(account,library_id) DO UPDATE SET status=EXCLUDED.status, fails=EXCLUDED.fails, error=EXCLUDED.error",
-            (name, lib_id, status, fails, redact(err)[:300]),
+            "UPDATE instagram_accounts SET status = %s, last_error = %s WHERE id = %s::uuid AND status IN ('active', 'pending')",
+            (status, message[:400], acc_id),
         )
-    return status
 
 
-# ----------------------------------------------------------------- download
-def download(lib_id, tg_file_id, video_url, dest_dir):
+# ----------------------------------------------------------------- verify new Session IDs
+def verify_pending():
+    import psycopg2.errors
+
+    with db() as cur:
+        cur.execute(
+            "SELECT id::text, access_token_encrypted FROM instagram_accounts "
+            "WHERE auth_type = 'session' AND status = 'pending' ORDER BY connected_at LIMIT 3"
+        )
+        rows = cur.fetchall()
+    for acc_id, enc in rows:
+        try:
+            sid = decrypt_token(enc)
+            cl = make_client(acc_id, sid)
+            try:
+                info = cl.account_info()
+                username, pk = info.username, str(info.pk)
+            except Exception as e:  # noqa: BLE001 - some profiles fail model validation; fall back
+                if classify(e) == "auth":
+                    raise
+                pk = str(cl.user_id)
+                username = cl.user_info_v1(int(pk)).username
+        except Exception as e:  # noqa: BLE001
+            kind = classify(e)
+            msg = AUTH_MESSAGE if kind == "auth" else f"Session verify nahi hua: {redact(e)[:200]}"
+            log.error("%s: verify failed (%s): %s", acc_id[:8], kind, redact(e)[:200])
+            mark_account(acc_id, "expired", msg)
+            continue
+        try:
+            with db() as cur:
+                cur.execute(
+                    "UPDATE instagram_accounts SET instagram_user_id = %s, username = %s, status = 'active', "
+                    "last_error = NULL, connected_at = now() WHERE id = %s::uuid AND status = 'pending'",
+                    (pk, username, acc_id),
+                )
+            _clients[acc_id] = cl
+            log.info("session account verified: @%s", username)
+        except psycopg2.errors.UniqueViolation:
+            mark_account(acc_id, "revoked", f"@{username} pehle se connected hai. Purana account disconnect karke dobara try karo.")
+
+
+# ----------------------------------------------------------------- posting
+def download(url, dest):
     import requests
 
-    if tg_file_id:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        if not token:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN missing (needed to download Telegram videos)")
-        r = requests.post(f"https://api.telegram.org/bot{token}/getFile", json={"file_id": tg_file_id}, timeout=30)
-        data = r.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram getFile failed: {data.get('description')}")
-        url = f"https://api.telegram.org/file/bot{token}/{data['result']['file_path']}"
-    else:
-        url = video_url
-    dest = Path(dest_dir) / f"{lib_id}.mp4"
     size = 0
     with requests.get(url, stream=True, timeout=60) as resp:
         resp.raise_for_status()
@@ -264,125 +275,167 @@ def download(lib_id, tg_file_id, video_url, dest_dir):
     return dest
 
 
-# ----------------------------------------------------------------- instagram
-def make_client(acc):
-    from instagrapi import Client
+def fetch_video(reel_id, tg_file_id, video_url, tmp):
+    import requests
 
-    name = acc["name"]
-    cl = Client()
-    cl.delay_range = [2, 6]
-    password = os.environ.get(f"IG_PASS_{name.upper()}", "").strip()
-    sessionid = os.environ.get(f"IG_SESSIONID_{name.upper()}", "").strip()
+    if tg_file_id:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+        r = requests.post(f"https://api.telegram.org/bot{token}/getFile", json={"file_id": tg_file_id}, timeout=30).json()
+        if not r.get("ok"):
+            raise RuntimeError(f"Telegram getFile failed: {r.get('description')}")
+        url = f"https://api.telegram.org/file/bot{token}/{r['result']['file_path']}"
+    elif video_url:
+        url = video_url
+    else:
+        raise RuntimeError("This post has no video attached.")
+    return download(url, Path(tmp) / f"{reel_id}.mp4")
 
-    settings = load_session(name)
-    ok = False
-    if settings:
-        cl.set_settings(settings)
-        if acc.get("proxy"):
-            cl.set_proxy(acc["proxy"])
+
+def fetch_cover(cover_url, tmp):
+    """The dashboard's fixed cover (JPG). Optional: any problem just means Instagram picks its own frame."""
+    if not cover_url:
+        return None
+    try:
+        return download(cover_url, Path(tmp) / "cover.jpg")
+    except Exception as e:  # noqa: BLE001
+        log.warning("cover skipped: %s", redact(e)[:120])
+        return None
+
+
+def claim_next():
+    with db() as cur:
+        cur.execute(
+            """UPDATE reels r SET status = 'publishing', attempts = r.attempts + 1, error = NULL
+               WHERE r.id = (
+                 SELECT r2.id FROM reels r2
+                 JOIN instagram_accounts a ON a.id = r2.instagram_account_id
+                 WHERE a.auth_type = 'session' AND a.status = 'active'
+                   AND r2.status = 'scheduled' AND r2.scheduled_at <= now()
+                   AND NOT EXISTS (SELECT 1 FROM reels x WHERE x.instagram_account_id = r2.instagram_account_id AND x.status = 'publishing')
+                 ORDER BY r2.scheduled_at, r2.created_at
+                 LIMIT 1
+                 FOR UPDATE OF r2 SKIP LOCKED)
+               RETURNING r.id::text, r.instagram_account_id::text, r.tg_file_id, r.video_url, r.cover_url, r.caption, r.attempts"""
+        )
+        return cur.fetchone()
+
+
+def requeue(reel_id, delay_s, burn_attempt, reason):
+    with db() as cur:
+        cur.execute(
+            """UPDATE reels SET status = 'scheduled', scheduled_at = now() + make_interval(secs => %s),
+                 attempts = GREATEST(attempts - %s, 0), error = %s
+               WHERE id = %s::uuid AND status = 'publishing'""",
+            (int(delay_s), 0 if burn_attempt else 1, redact(reason)[:400], reel_id),
+        )
+
+
+def fail_job(reel_id, message):
+    with db() as cur:
+        cur.execute(
+            "UPDATE reels SET status = 'failed', error = %s WHERE id = %s::uuid AND status <> 'published'",
+            (redact(message)[:500], reel_id),
+        )
+
+
+def push_account_back(acc_id, minutes):
+    with db() as cur:
+        cur.execute(
+            """UPDATE reels SET scheduled_at = GREATEST(scheduled_at, now() + make_interval(mins => %s))
+               WHERE instagram_account_id = %s::uuid AND status = 'scheduled'""",
+            (int(minutes), acc_id),
+        )
+
+
+def published_last_24h(acc_id):
+    with db() as cur:
+        cur.execute(
+            "SELECT count(*) FROM reels WHERE instagram_account_id = %s::uuid AND status = 'published' "
+            "AND published_at > now() - interval '24 hours'",
+            (acc_id,),
+        )
+        return cur.fetchone()[0]
+
+
+def mark_published(reel_id, acc_id, media_pk):
+    last = None
+    for _ in range(3):  # the post is already live: make sure the result gets saved
         try:
-            cl.get_timeline_feed()  # cheap check that the stored session still works
-            ok = True
+            with db() as cur:
+                cur.execute(
+                    "UPDATE reels SET status = 'published', ig_media_id = %s, published_at = now(), error = NULL WHERE id = %s::uuid",
+                    (str(media_pk), reel_id),
+                )
+                cur.execute(
+                    "UPDATE instagram_accounts SET last_used_at = now(), last_error = NULL WHERE id = %s::uuid", (acc_id,)
+                )
+            return
         except Exception as e:  # noqa: BLE001
-            log.warning("%s: stored session invalid (%s), logging in again", name, redact(e)[:120])
-            old = cl.get_settings()
-            cl.set_settings({})
-            cl.set_uuids(old.get("uuids", {}))
-    if not ok:
-        if acc.get("proxy"):
-            cl.set_proxy(acc["proxy"])
-        if sessionid:
-            cl.login_by_sessionid(sessionid)
-        elif password:
-            code = cl.totp_generate_code(acc["totp_secret"]) if acc.get("totp_secret") else ""
-            cl.login(acc["username"], password, verification_code=code)
-        else:
-            raise RuntimeError(f"{name}: set IG_PASS_{name.upper()} or IG_SESSIONID_{name.upper()}")
-    save_session(name, cl.get_settings())
-    return cl
+            last = e
+            time.sleep(3)
+    log.error("POSTED but could not save result for reel %s: %s", reel_id, redact(last)[:200])
 
 
-def get_client(acc):
-    if acc["name"] not in _clients:
-        _clients[acc["name"]] = make_client(acc)
-    return _clients[acc["name"]]
+def run_job(job):
+    reel_id, acc_id, tg_file_id, video_url, cover_url, caption, attempts = job
 
-
-def classify(exc):
-    from instagrapi.exceptions import (
-        BadPassword, ChallengeRequired, LoginRequired, PleaseWaitFewMinutes, RateLimitError, TwoFactorRequired,
-    )
-
-    if isinstance(exc, (ChallengeRequired, LoginRequired, BadPassword, TwoFactorRequired)):
-        return "auth", timedelta(hours=12)
-    if isinstance(exc, (PleaseWaitFewMinutes, RateLimitError)):
-        return "rate", timedelta(hours=1)
-    return "other", timedelta(minutes=20)
-
-
-# ----------------------------------------------------------------- posting
-def post_one(acc, unique):
-    name = acc["name"]
-    st = STATE[name]
-    now = datetime.now(TZ)
-
-    row = pick_video(acc, unique)
-    if not row:
-        st["next"] = now + timedelta(minutes=15)  # memory only: do not wake the DB every minute
-        log.info("%s: library mein koi naya video nahi (Telegram bot se video bhejiye)", name)
-        return
-    lib_id, tg_file_id, video_url = row
-    caption = build_caption(acc)
-
-    if DRY_RUN:
-        st["next"] = now + timedelta(minutes=random.randint(acc["min_gap_min"], acc["max_gap_min"]))
-        log.info("[dry-run] %s would post library %s | caption: %s", name, lib_id, caption.replace("\n", " "))
+    if published_last_24h(acc_id) >= DAILY_CAP:
+        requeue(reel_id, 3600, False, "Daily posting limit reached; will try again later.")
+        log.info("%s: daily cap (%d) reached, waiting", acc_id[:8], DAILY_CAP)
         return
 
     tmp = tempfile.mkdtemp(prefix="rb_")
+    phase = "prepare"
     try:
-        path = download(lib_id, tg_file_id, video_url, tmp)
-        cl = get_client(acc)
-        media = cl.clip_upload(path, caption)
+        sid, username = account_secret(acc_id)
+        video = fetch_video(reel_id, tg_file_id, video_url, tmp)
+        thumb = fetch_cover(cover_url, tmp)
+        cl = get_client(acc_id, sid)
+        phase = "upload"
+        media = cl.clip_upload(video, spin(caption or ""), thumbnail=thumb)
     except Exception as e:  # noqa: BLE001
-        kind, wait = classify(e)
-        _clients.pop(name, None)
+        kind = classify(e)
         msg = redact(e)
-        status = record_fail(name, lib_id, 1 if kind == "other" else 0, msg)
-        st["paused"] = now + wait
-        save_state(name)
-        log.error("%s: upload fail (%s): %s -> pause %s [%s]", name, kind, msg[:200], wait, status)
+        _clients.pop(acc_id, None)
+        if kind == "auth":
+            mark_account(acc_id, "expired", AUTH_MESSAGE)
+            requeue(reel_id, 60, False, "Waiting for a new Session ID.")
+            log.error("%s: session problem: %s", acc_id[:8], msg[:200])
+        elif kind == "rate":
+            push_account_back(acc_id, 30)
+            requeue(reel_id, 30 * 60, False, "Instagram rate limit; will try again later.")
+            log.error("%s: rate limited: %s -> pause 30 min", acc_id[:8], msg[:200])
+        elif phase == "prepare":
+            if attempts < MAX_ATTEMPTS:
+                delay = min(1800, 120 * 2 ** max(attempts - 1, 0))
+                requeue(reel_id, delay, True, f"Temporary problem, retrying: {msg[:200]}")
+            else:
+                fail_job(reel_id, msg)
+            log.error("%s: prepare failed (attempt %d): %s", acc_id[:8], attempts, msg[:200])
+        else:
+            # Outcome of the upload is unknown: it may be live. Never retry automatically.
+            fail_job(reel_id, f"Instagram ne confirm nahi kiya, dobara try nahi kiya (duplicate se bachne ke liye). Profile check karo. ({msg[:150]})")
+            log.error("%s: upload outcome unknown: %s", acc_id[:8], msg[:200])
         return
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    with db() as cur:
-        cur.execute(
-            "INSERT INTO rb_posts(account,library_id,status,media_pk,posted_at) VALUES(%s,%s,'posted',%s,%s) "
-            "ON CONFLICT(account,library_id) DO UPDATE SET status='posted', media_pk=EXCLUDED.media_pk, posted_at=EXCLUDED.posted_at",
-            (name, lib_id, str(media.pk), now),
-        )
-    day = now.strftime("%Y-%m-%d")
-    COUNT[name] = (day, today_count(name, now) + 1)
-    gap = random.randint(acc["min_gap_min"], acc["max_gap_min"])
-    st["next"] = now + timedelta(minutes=gap)
-    save_state(name)
-    log.info("%s: POSTED library %s (pk=%s). next in ~%d min", name, lib_id, media.pk, gap)
+    mark_published(reel_id, acc_id, media.pk)
+    log.info("@%s: POSTED reel %s (pk=%s)", username, reel_id[:8], media.pk)
 
 
-def due(acc, now):
-    st = STATE[acc["name"]]
-    if st["paused"] and now < st["paused"]:
-        return False
-    if today_count(acc["name"], now) >= acc["daily_cap"]:
-        return False
-    if not in_window(acc, now):
-        return False
-    if st["next"] and now < st["next"]:
-        return False
-    return True
+def process_due():
+    for _ in range(JOBS_PER_TICK):
+        job = claim_next()
+        if not job:
+            break
+        run_job(job)
+        time.sleep(random.randint(5, 20))
 
 
+# ----------------------------------------------------------------- housekeeping + commands
 def keepalive():
     import requests
 
@@ -397,34 +450,31 @@ def keepalive():
             pass
 
 
-# ----------------------------------------------------------------- commands
 def cmd_check(_):
-    accounts, unique = load_accounts()
     init_db()
     with db() as cur:
-        cur.execute("SELECT COUNT(*) FROM library")
-        n = cur.fetchone()[0]
-    print(f"OK: {len(accounts)} account(s), unique_across_accounts={unique}, library rows={n}, tz={TZ}")
+        cur.execute("SELECT status, count(*) FROM instagram_accounts WHERE auth_type = 'session' GROUP BY status")
+        accs = dict(cur.fetchall())
+        cur.execute(
+            "SELECT count(*) FROM reels r JOIN instagram_accounts a ON a.id = r.instagram_account_id "
+            "WHERE a.auth_type = 'session' AND r.status = 'scheduled'"
+        )
+        waiting = cur.fetchone()[0]
+    print(f"OK: session accounts={accs or 0}, scheduled reels waiting={waiting}, daily cap={DAILY_CAP}")
 
 
 def cmd_run(_):
-    accounts, unique = load_accounts()
     init_db()
-    load_state(accounts)
     threading.Thread(target=keepalive, daemon=True).start()
-    log.info("reelbot start: %d account(s), tz=%s%s", len(accounts), TZ, " [DRY-RUN]" if DRY_RUN else "")
+    log.info("reelbot start (session-ID mode), daily cap %d/account", DAILY_CAP)
     while True:
         try:
-            now = datetime.now(TZ)
-            random.shuffle(accounts)
-            for acc in accounts:
-                if due(acc, now):
-                    post_one(acc, unique)
-                    time.sleep(random.randint(20, 90))
+            verify_pending()
+            process_due()
         except Exception as e:  # noqa: BLE001 - never let the loop die
             log.error("loop error: %s", redact(e)[:300])
-            time.sleep(120)
-        time.sleep(60)
+            time.sleep(60)
+        time.sleep(TICK_SECONDS)
 
 
 def main():
