@@ -1,8 +1,8 @@
 #!/bin/sh
-# Koyeb web service entrypoint: migrations -> (optional) reelbot in background -> Node web server.
+# Koyeb web service entrypoint: migrations -> reelbot worker in background -> Node web server.
 node server/dist/db/migrate.js || exit 1
 
-if [ -n "$ACCOUNTS_JSON" ]; then
+if [ "$REELBOT_DISABLED" != "true" ]; then
   (
     while true; do
       /opt/venv/bin/python reelbot/reel_bot.py run
@@ -11,7 +11,7 @@ if [ -n "$ACCOUNTS_JSON" ]; then
     done
   ) &
 else
-  echo "ACCOUNTS_JSON not set: reelbot disabled"
+  echo "REELBOT_DISABLED=true: session-ID worker off"
 fi
 
 exec node server/dist/index.js
