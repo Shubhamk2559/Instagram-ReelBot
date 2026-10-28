@@ -174,7 +174,7 @@ instagramRouter.get(
   "/accounts",
   wrap(async (req, res) => {
     const { rows } = await pool.query(
-      `SELECT id, username, account_type, token_expires_at, connected_at, last_used_at, last_error,
+      `SELECT id, username, account_type, auth_type, token_expires_at, connected_at, last_used_at, last_error,
               CASE
                 WHEN status = 'active' AND token_expires_at IS NOT NULL AND token_expires_at < now() THEN 'expired'
                 ELSE status
@@ -185,6 +185,49 @@ instagramRouter.get(
     res.json({
       accounts: rows.map((a) => ({ ...a, last_error: a.last_error ? redact(String(a.last_error)) : null })),
     });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Session ID login (unofficial, no Meta developer app needed).
+// The Session ID is saved encrypted as "pending"; the reelbot worker verifies it,
+// fills in the real username and flips the account to "active" (or "expired" with a reason).
+// ---------------------------------------------------------------------------
+const MAX_SESSION_ACCOUNTS = 10;
+
+// Accepts "sessionid=...; ..." / quoted / URL-encoded / decoded input. Returns the cookie form (":" as %3A) or null.
+function cleanSessionId(raw: string): string | null {
+  let s = raw.trim().replace(/^["']+|["']+$/g, "");
+  s = s.replace(/^sessionid\s*=\s*/i, "").replace(/;.*$/, "").trim();
+  try {
+    s = decodeURIComponent(s);
+  } catch {
+    /* keep as typed */
+  }
+  if (!/^\d{4,}:[A-Za-z0-9_.:-]{10,400}$/.test(s)) return null;
+  return s.replace(/:/g, "%3A");
+}
+
+instagramRouter.post(
+  "/session",
+  wrap(async (req, res) => {
+    const parsed = z.object({ sessionid: z.string().min(20).max(800) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Session ID paste karo (instagram.com ki 'sessionid' cookie value)." });
+    const sid = cleanSessionId(parsed.data.sessionid);
+    if (!sid) return res.status(400).json({ error: "Ye session ID jaisa nahi lag raha. Poori 'sessionid' cookie value paste karo (jaise 1234567890%3Aabc...)." });
+
+    const uid = req.user!.id;
+    const count = await pool.query("SELECT count(*)::int AS n FROM instagram_accounts WHERE user_id = $1 AND auth_type = 'session'", [uid]);
+    if (count.rows[0].n >= MAX_SESSION_ACCOUNTS) {
+      return res.status(400).json({ error: `Ek user ke liye max ${MAX_SESSION_ACCOUNTS} session accounts. Pehle koi disconnect karo.` });
+    }
+    await pool.query(
+      `INSERT INTO instagram_accounts
+         (user_id, instagram_user_id, username, account_type, access_token_encrypted, status, auth_type)
+       VALUES ($1, $2, 'Verify ho raha hai...', 'session', $3, 'pending', 'session')`,
+      [uid, `pending-${newToken(9)}`, encryptToken(sid)]
+    );
+    res.json({ ok: true });
   })
 );
 
